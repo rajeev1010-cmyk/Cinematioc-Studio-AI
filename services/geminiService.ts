@@ -1,5 +1,4 @@
 
-import { GoogleGenAI, Type } from "@google/genai";
 import { StudioState, SubjectConfig, Landmark, ReferenceType } from "../types";
 import { LENSES, PRODUCTION_SCALE_CONSTANT, COST_PER_IMAGE, COST_PER_VIDEO, COST_PER_1K_TOKENS } from "../constants";
 
@@ -36,40 +35,16 @@ async function downscaleImage(dataUrl: string, maxWidth = 512, quality = 0.7): P
 }
 
 export const analyzeBackground = async (dataUrl: string): Promise<Partial<Landmark>[]> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   const { data, mimeType } = await downscaleImage(dataUrl, 1024, 0.8);
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-flash-preview',
-    contents: {
-      parts: [
-        { inlineData: { data, mimeType } },
-        { text: "Identify key background landmarks. Provide labels, descriptions, and relative 3D positions (X: -30 to 30, Z: 20 to 100)." }
-      ]
-    },
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            label: { type: Type.STRING },
-            description: { type: Type.STRING },
-            x: { type: Type.NUMBER },
-            z: { type: Type.NUMBER }
-          },
-          required: ["label", "description", "x", "z"]
-        }
-      }
-    }
+  const response = await fetch('/api/analyze-background', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data, mimeType })
   });
-
-  try {
-    return JSON.parse(response.text || "[]");
-  } catch (e) {
-    return [];
-  }
+  
+  if (!response.ok) throw new Error("Environment analysis failed on server.");
+  return response.json();
 };
 
 const getShotScaleLabel = (percentage: number) => {
