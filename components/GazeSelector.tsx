@@ -1,3 +1,4 @@
+
 import React from 'react';
 import { Eye, Monitor, Users, MoveRight, MoveLeft, Target } from 'lucide-react';
 import { SubjectConfig, CameraConfig } from '../types';
@@ -12,27 +13,28 @@ interface GazeSelectorProps {
 
 const GazeSelector: React.FC<GazeSelectorProps> = ({ subjectId, config, activeCamera, otherSubject, onChange }) => {
   
-  const getAngleTo = (tx: number, ty: number) => {
+  const getAngleTo = (tx: number, tz: number) => {
     const dx = tx - config.x;
-    const dy = ty - config.y;
-    let angleRad = Math.atan2(dx, dy);
+    const dz = tz - config.z;
+    // New calibration: South is 0deg.
+    let angleRad = Math.atan2(dx, -dz);
     let angleDeg = (angleRad * 180) / Math.PI;
     if (angleDeg < 0) angleDeg += 360;
     return Math.round(angleDeg);
   };
 
-  const setGazeToCamera = () => onChange(getAngleTo(activeCamera.x, activeCamera.y));
+  const setGazeToCamera = () => onChange(getAngleTo(activeCamera.x, activeCamera.z));
   
   const setGazeToPartner = () => {
     if (!otherSubject) return;
-    onChange(getAngleTo(otherSubject.x, otherSubject.y));
+    onChange(getAngleTo(otherSubject.x, otherSubject.z));
   };
 
   const PRESETS = [
-    { label: 'Into Lens', icon: <Target className="w-3 h-3" />, action: setGazeToCamera },
+    { label: 'Into Lens (0°)', icon: <Target className="w-3 h-3" />, action: setGazeToCamera },
     { label: 'Partner', icon: <Users className="w-3 h-3" />, action: setGazeToPartner, disabled: !otherSubject },
-    { label: 'Left Field', icon: <MoveLeft className="w-3 h-3" />, action: () => onChange(270) },
-    { label: 'Right Field', icon: <MoveRight className="w-3 h-3" />, action: () => onChange(90) },
+    { label: 'Left Field', icon: <MoveLeft className="w-3 h-3" />, action: () => onChange(90) },
+    { label: 'Right Field', icon: <MoveRight className="w-3 h-3" />, action: () => onChange(270) },
   ];
 
   return (
@@ -40,8 +42,8 @@ const GazeSelector: React.FC<GazeSelectorProps> = ({ subjectId, config, activeCa
       <div className="flex justify-between items-center px-0.5">
         <p className="text-[8px] font-bold text-white/30 uppercase">Subject {subjectId.toUpperCase()}</p>
         <div className="flex items-center gap-1.5">
-           {Math.abs(config.gaze - getAngleTo(activeCamera.x, activeCamera.y)) < 5 && (
-             <span className="text-[7px] font-black text-emerald-400 bg-emerald-500/20 px-1 rounded animate-pulse">FIXED ON LENS</span>
+           {Math.abs(config.gaze - getAngleTo(activeCamera.x, activeCamera.z)) < 5 && (
+             <span className="text-[7px] font-black text-emerald-400 bg-emerald-500/20 px-1 rounded animate-pulse">LENS LOCK</span>
            )}
            <span className="text-[8px] font-mono font-bold text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded">
             {config.gaze}°
@@ -73,7 +75,7 @@ const GazeSelector: React.FC<GazeSelectorProps> = ({ subjectId, config, activeCa
           className="absolute inset-0 w-full h-full appearance-none bg-transparent cursor-pointer accent-emerald-500"
         />
       </div>
-      <p className="text-[7px] text-white/20 uppercase tracking-widest text-center">Relative Gaze Angle</p>
+      <p className="text-[7px] text-white/20 uppercase tracking-widest text-center">Gaze Angle (0° = Facing Lens)</p>
     </div>
   );
 };

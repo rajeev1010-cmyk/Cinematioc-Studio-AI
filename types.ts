@@ -1,8 +1,11 @@
+
 export type ReferenceType = 
   | 'background' 
-  | 'char_a' | 'pose_a' 
-  | 'char_b' | 'pose_b' 
-  | 'prop';
+  | 'character' 
+  | 'costume' 
+  | 'prop' 
+  | 'accessories' 
+  | 'pose';
 
 export interface ReferenceImage {
   id: ReferenceType;
@@ -12,10 +15,21 @@ export interface ReferenceImage {
 }
 
 export interface SubjectConfig {
-  x: number; // Stage Left (-) to Stage Right (+)
-  z: number; // Proscenium (0) to Deep Stage (+)
-  rotation: number; // 0-360
-  gaze: number; // 0-360
+  id: string;
+  x: number;
+  z: number;
+  rotation: number;
+  gaze: number;
+  label: string;
+  references: Partial<Record<ReferenceType, ReferenceImage>>;
+}
+
+export interface Landmark {
+  id: string;
+  label: string;
+  description: string;
+  x: number;
+  z: number;
 }
 
 export interface CameraConfig {
@@ -28,22 +42,33 @@ export interface CameraConfig {
   verticalAngle: string;
 }
 
+export interface UsageStats {
+  totalSpent: number;
+  analysis: number;
+  render: number;
+  video: number;
+  tokens: number;
+}
+
 export interface StudioState {
   references: Record<ReferenceType, ReferenceImage>;
   lighting: {
     positions: boolean[];
   };
-  subjects: {
-    a: SubjectConfig;
-    b: SubjectConfig;
-    activeCount: 1 | 2;
-  };
+  subjects: SubjectConfig[];
+  landmarks: Landmark[];
   cameras: CameraConfig[];
   activeCameraIndex: number;
   isGenerating: boolean;
   isGeneratingPrompt: boolean;
   isReviewingPrompt: boolean;
+  isReviewingVideoPrompt: boolean;
+  isGeneratingVideo: boolean;
+  videoStatus?: string;
   draftPrompt: string;
   generatedImage?: string;
+  generatedVideo?: string;
   plannerZoom: number;
+  plannerOffset: { x: number; z: number };
+  usage: UsageStats;
 }

@@ -1,216 +1,264 @@
-import { Camera } from 'lucide-react';
+
+import { Camera, MapPin, Eye, Move } from 'lucide-react';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { CameraConfig, StudioState, SubjectConfig } from '../types';
+import { CameraConfig, StudioState, SubjectConfig, Landmark } from '../types';
+import { LENSES } from '../constants';
 
 interface FloorPlannerProps {
   state: StudioState;
-  onUpdateSubject: (id: 'a' | 'b', updates: Partial<SubjectConfig>) => void;
+  onUpdateSubject: (id: string, updates: Partial<SubjectConfig>) => void;
+  onUpdateLandmark: (id: string, updates: Partial<Landmark>) => void;
   onUpdateCamera: (index: number, updates: Partial<CameraConfig>) => void;
+  onUpdatePlanner: (updates: { zoom?: number; offset?: { x: number; z: number } }) => void;
   onSelectCamera: (index: number) => void;
 }
 
 const FloorPlanner: React.FC<FloorPlannerProps> = ({ 
-  state,
-  onUpdateSubject,
-  onUpdateCamera,
-  onSelectCamera
+  state, onUpdateSubject, onUpdateLandmark, onUpdateCamera, onUpdatePlanner, onSelectCamera 
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [dragState, setDragState] = useState<{ 
-    type: 'move' | 'rotate-body' | 'rotate-gaze' | 'rotate-cam'; 
-    target: 'subject' | 'camera';
+  const [activeDrag, setActiveDrag] = useState<{ 
+    type: 'move' | 'rotate-body' | 'rotate-gaze' | 'pan' | 'pinch'; 
+    target: 'subject' | 'camera' | 'landmark' | 'background';
     id: any;
+    startX: number;
+    startY: number;
+    initialOffset: { x: number; z: number };
+    initialDist?: number;
+    initialZoom?: number;
   } | null>(null);
 
-  const { subjects, cameras, activeCameraIndex, plannerZoom } = state;
-  const handlersRef = useRef({ onUpdateSubject, onUpdateCamera, onSelectCamera });
-  
-  useEffect(() => {
-    handlersRef.current = { onUpdateSubject, onUpdateCamera, onSelectCamera };
-  }, [onUpdateSubject, onUpdateCamera, onSelectCamera]);
+  const getRange = useCallback(() => 50 / state.plannerZoom, [state.plannerZoom]);
 
-  const getFovAngle = (lens: string) => {
-    const mm = lens.match(/(\d+)mm/);
-    const focalLength = mm ? parseInt(mm[1]) : 50;
-    return 2 * Math.atan(18 / focalLength) * (180 / Math.PI);
-  };
-
-  const startDrag = (type: any, target: any, id: any) => (e: React.MouseEvent | React.TouchEvent) => {
+  const handleStart = (type: 'move' | 'rotate-body' | 'rotate-gaze' | 'pan', target: any, id: any) => (e: React.MouseEvent | React.TouchEvent) => {
     if (e.cancelable) e.preventDefault();
     e.stopPropagation();
-    if (target === 'camera' && type === 'move') handlersRef.current.onSelectCamera(id as number);
-    setDragState({ type, target, id });
+
+    const clientX = 'clientX' in e ? e.clientX : e.touches[0].clientX;
+    const clientY = 'clientY' in e ? e.clientY : e.touches[0].clientY;
+
+    if (target === 'camera' && type === 'move') onSelectCamera(id);
+
+    if ('touches' in e && e.touches.length === 2) {
+      const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+      setActiveDrag({ type: 'pinch', target: 'background', id: null, startX: clientX, startY: clientY, initialOffset: { ...state.plannerOffset }, initialDist: dist, initialZoom: state.plannerZoom });
+      return;
+    }
+    
+    setActiveDrag({ type, target, id, startX: clientX, startY: clientY, initialOffset: { ...state.plannerOffset } });
   };
 
-  const handleInteraction = useCallback((clientX: number, clientY: number) => {
-    if (!dragState || !containerRef.current) return;
-
+  const handleMove = useCallback((clientX: number, clientY: number) => {
+    if (!activeDrag || !containerRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
-    // Coordination Range: 100ft at 1.0 zoom
-    const range = 50 / plannerZoom;
+    const range = getRange();
 
-    if (dragState.type === 'move') {
-      const coordX = ((clientX - rect.left) / rect.width - 0.5) * (range * 2);
-      const coordZ = (1 - (clientY - rect.top) / rect.height) * (range * 2);
+    if (activeDrag.type === 'pan') {
+      const dx = (clientX - activeDrag.startX) / rect.width * (range * 2);
+      const dy = (clientY - activeDrag.startY) / rect.height * (range * 2);
+      onUpdatePlanner({ offset: { x: activeDrag.initialOffset.x + dx, z: activeDrag.initialOffset.z - dy } });
+      return;
+    }
+
+    if (activeDrag.type === 'move') {
+      const x = ((clientX - rect.left) / rect.width - 0.5) * (range * 2) - state.plannerOffset.x;
+      const z = (0.5 - (clientY - rect.top) / rect.height) * (range * 2) + state.plannerOffset.z;
       
-      const boundedX = coordX; 
-      const boundedZ = Math.max(0, coordZ); 
+      if (activeDrag.target === 'subject') onUpdateSubject(activeDrag.id, { x, z });
+      else if (activeDrag.target === 'landmark') onUpdateLandmark(activeDrag.id, { x, z });
+      else if (activeDrag.target === 'camera') onUpdateCamera(activeDrag.id, { x, z });
+      return;
+    }
 
-      if (dragState.target === 'subject') {
-        handlersRef.current.onUpdateSubject(dragState.id, { x: boundedX, z: boundedZ });
+    if (activeDrag.type === 'rotate-body' || activeDrag.type === 'rotate-gaze') {
+      const targetObj: any = activeDrag.target === 'subject' 
+        ? state.subjects.find(s => s.id === activeDrag.id) 
+        : state.cameras[activeDrag.id];
+      
+      if (!targetObj) return;
+
+      const objScreenX = rect.left + rect.width * (0.5 + (targetObj.x + state.plannerOffset.x) / (range * 2));
+      const objScreenY = rect.top + rect.height * (0.5 - (targetObj.z + state.plannerOffset.z) / (range * 2));
+      
+      const rawAngle = (Math.atan2(clientX - objScreenX, -(clientY - objScreenY)) * 180 / Math.PI + 360) % 360;
+      const angle = (rawAngle + 180) % 360;
+      
+      if (activeDrag.type === 'rotate-body') {
+        if (activeDrag.target === 'subject') onUpdateSubject(activeDrag.id, { rotation: angle });
+        else if (activeDrag.target === 'camera') onUpdateCamera(activeDrag.id, { rotation: angle });
       } else {
-        handlersRef.current.onUpdateCamera(dragState.id, { x: boundedX, z: boundedZ });
-      }
-    } else {
-      const targetObj = dragState.target === 'subject' ? subjects[dragState.id as 'a' | 'b'] : cameras[dragState.id];
-      const objScreenX = rect.left + rect.width * (0.5 + targetObj.x / (range * 2));
-      const objScreenY = rect.top + rect.height * (1 - targetObj.z / (range * 2));
-      
-      const dx = clientX - objScreenX;
-      const dy = clientY - objScreenY;
-      let angle = (Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360;
-
-      if (dragState.type === 'rotate-body' && dragState.target === 'subject') {
-        handlersRef.current.onUpdateSubject(dragState.id, { rotation: angle });
-      } else if (dragState.type === 'rotate-gaze' && dragState.target === 'subject') {
-        handlersRef.current.onUpdateSubject(dragState.id, { gaze: angle });
-      } else if (dragState.type === 'rotate-cam' && dragState.target === 'camera') {
-        handlersRef.current.onUpdateCamera(dragState.id, { rotation: angle });
+        onUpdateSubject(activeDrag.id, { gaze: angle });
       }
     }
-  }, [dragState, plannerZoom, subjects, cameras]);
-
-  const onMouseMove = useCallback((e: MouseEvent) => handleInteraction(e.clientX, e.clientY), [handleInteraction]);
-  const endDrag = useCallback(() => setDragState(null), []);
+  }, [activeDrag, state, getRange, onUpdatePlanner, onUpdateSubject, onUpdateLandmark, onUpdateCamera]);
 
   useEffect(() => {
-    if (dragState) {
-      window.addEventListener('mousemove', onMouseMove);
-      window.addEventListener('mouseup', endDrag);
-    }
+    const onMouseMove = (e: MouseEvent) => handleMove(e.clientX, e.clientY);
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.cancelable) e.preventDefault();
+      if (e.touches.length === 2 && activeDrag?.type === 'pinch') {
+        const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+        const scale = dist / (activeDrag.initialDist || 1);
+        onUpdatePlanner({ zoom: Math.max(0.1, Math.min(5, (activeDrag.initialZoom || 1) * scale)) });
+      } else if (e.touches.length > 0) {
+        handleMove(e.touches[0].clientX, e.touches[0].clientY);
+      }
+    };
+    const onEnd = () => setActiveDrag(null);
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onEnd);
+    window.addEventListener('touchmove', onTouchMove, { passive: false });
+    window.addEventListener('touchend', onEnd);
+    window.addEventListener('touchcancel', onEnd);
+
     return () => {
       window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', endDrag);
+      window.removeEventListener('mouseup', onEnd);
+      window.removeEventListener('touchmove', onTouchMove);
+      window.removeEventListener('touchend', onEnd);
+      window.removeEventListener('touchcancel', onEnd);
     };
-  }, [dragState, onMouseMove, endDrag]);
+  }, [activeDrag, handleMove, onUpdatePlanner]);
 
-  const getStyle = (obj: {x: number, z: number}) => {
-    const range = 50 / plannerZoom;
-    const left = `${((obj.x / (range * 2)) + 0.5) * 100}%`;
-    const top = `${(1 - (obj.z / (range * 2))) * 100}%`;
-    return { left, top };
+  const getPos = (obj: { x: number, z: number }) => {
+    const range = getRange();
+    const left = (((obj.x + state.plannerOffset.x) / (range * 2)) + 0.5) * 100;
+    const bottom = (((obj.z + state.plannerOffset.z) / (range * 2)) + 0.5) * 100;
+    return { left: `${left}%`, bottom: `${bottom}%` };
   };
 
-  const renderSubject = (id: 'a' | 'b', config: SubjectConfig) => {
-    const isDragging = dragState?.target === 'subject' && dragState.id === id;
-    const style = getStyle(config);
-    
-    const topNum = parseFloat(style.top);
-    const leftNum = parseFloat(style.left);
-    if (topNum < -20 || topNum > 120 || leftNum < -20 || leftNum > 120) return null;
-
-    return (
-      <div 
-        key={id}
-        style={style}
-        className={`absolute -translate-x-1/2 -translate-y-1/2 z-20 group select-none transition-transform ${isDragging ? 'z-30 scale-110' : ''}`}
-      >
-        <div className="relative w-20 h-20 flex items-center justify-center">
-          <div onMouseDown={startDrag('move', 'subject', id)} className="absolute inset-4 cursor-grab active:cursor-grabbing rounded-full bg-white/5 border border-white/5 hover:bg-white/10 z-10"></div>
-          
-          <div className="absolute inset-0 transition-transform duration-75" style={{ transform: `rotate(${config.rotation}deg)` }}>
-            <svg viewBox="0 0 100 100" className="w-full h-full">
-              <ellipse cx="50" cy="50" rx="30" ry="15" fill={id === 'a' ? 'rgba(99, 102, 241, 0.4)' : 'rgba(168, 85, 247, 0.4)'} stroke={id === 'a' ? '#6366f1' : '#a855f7'} strokeWidth="2.5" />
-              <circle cx="50" cy="50" r="12" fill={id === 'a' ? '#6366f1' : '#a855f7'} />
-            </svg>
-            <div onMouseDown={startDrag('rotate-body', 'subject', id)} className="absolute top-1 left-1/2 -translate-x-1/2 w-4 h-4 bg-white rounded-full cursor-alias border-2 border-indigo-500 shadow-xl" />
-          </div>
-
-          <div className="absolute inset-0 pointer-events-none transition-transform duration-75" style={{ transform: `rotate(${config.gaze}deg)` }}>
-             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-[280%] flex flex-col items-center">
-                <div className="w-0.5 h-12 bg-gradient-to-t from-emerald-500 to-transparent opacity-60"></div>
-                <div onMouseDown={startDrag('rotate-gaze', 'subject', id)} className="w-5 h-5 bg-emerald-400 rounded-full cursor-alias pointer-events-auto shadow-lg border-2 border-white" />
-             </div>
-          </div>
-          
-          <div className="absolute -bottom-6 left-1/2 -translate-x-1/2 text-[7px] font-black uppercase text-white/40 tracking-widest whitespace-nowrap bg-black/60 px-2 rounded">
-            Actor {id.toUpperCase()}
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  const renderCamera = (cam: CameraConfig, index: number) => {
-    const isActive = activeCameraIndex === index;
-    const fov = getFovAngle(cam.lens);
-    const style = getStyle(cam);
-
-    return (
-      <div key={cam.id} style={style} className={`absolute -translate-x-1/2 -translate-y-1/2 select-none touch-none ${isActive ? 'z-40' : 'z-20'}`}>
-        <div 
-          className="absolute top-1/2 left-1/2 pointer-events-none transition-all duration-300"
-          style={{ 
-            transform: `translate(-50%, -50%) rotate(${cam.rotation}deg)`, 
-            opacity: isActive ? 0.3 : 0.05,
-            width: '1200px',
-            height: '1200px'
-          }}
-        >
-          <svg viewBox="0 0 1200 1200" className="w-full h-full">
-             <path d={`M 600 600 L ${600 - Math.tan((fov / 2) * Math.PI / 180) * 800} 0 L ${600 + Math.tan((fov / 2) * Math.PI / 180) * 800} 0 Z`} fill="url(#fovGradientPlanner)" />
-          </svg>
-        </div>
-
-        <div className={`relative p-3 rounded-2xl border transition-all ${isActive ? 'bg-indigo-600 border-indigo-300 scale-125 shadow-2xl' : 'bg-[#111] border-white/10 opacity-50'}`}>
-          <div onMouseDown={startDrag('move', 'camera', index)} className="absolute inset-0 cursor-grab active:cursor-grabbing z-0"></div>
-          <div className="relative z-10 transition-transform pointer-events-none" style={{ transform: `rotate(${cam.rotation}deg)` }}>
-            <Camera className="w-5 h-5 text-white" />
-            <div onMouseDown={startDrag('rotate-cam', 'camera', index)} className="absolute top-[-14px] left-1/2 -translate-x-1/2 w-4 h-4 bg-white rounded-full cursor-alias pointer-events-auto border-2 border-indigo-400" />
-          </div>
-          <div className="absolute -bottom-8 left-1/2 -translate-x-1/2 text-[8px] font-black text-white/40 uppercase whitespace-nowrap tracking-widest bg-black/40 px-2 rounded">
-            Node {index + 1}
-          </div>
-        </div>
-      </div>
-    );
+  const getFOV = (lensLabel: string) => {
+    const mm = LENSES.find(l => l.label === lensLabel)?.mm || 50;
+    return 2 * Math.atan(36 / (2 * mm)) * (180 / Math.PI);
   };
 
   return (
     <div 
-      ref={containerRef}
-      className="w-full h-full bg-[#030303] rounded-[3rem] border border-white/5 overflow-hidden shadow-[inset_0_0_200px_rgba(0,0,0,0.95)] cursor-crosshair relative select-none"
+      ref={containerRef} 
+      onMouseDown={handleStart('pan', 'background', null)} 
+      onTouchStart={handleStart('pan', 'background', null)}
+      className="w-full h-full relative overflow-hidden bg-[#050505] cursor-grab active:cursor-grabbing touch-none select-none"
+      style={{ touchAction: 'none' }}
     >
-      <svg className="absolute w-0 h-0">
-        <defs>
-          <linearGradient id="fovGradientPlanner" x1="0.5" y1="1" x2="0.5" y2="0">
-            <stop offset="0%" stopColor="#818cf8" stopOpacity="0.8" />
-            <stop offset="100%" stopColor="#6366f1" stopOpacity="0" />
-          </linearGradient>
-        </defs>
-      </svg>
-
-      <div className="absolute inset-0 opacity-[0.03]" style={{ 
-        backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', 
-        backgroundSize: `${20 * plannerZoom}px ${20 * plannerZoom}px`,
-        backgroundPosition: 'center bottom'
-      }}></div>
-
-      <div className="absolute left-10 inset-y-0 flex flex-col justify-between py-12 pointer-events-none border-l border-white/5">
-         <span className="text-[8px] font-black text-white/10 uppercase tracking-[0.5em] -rotate-90">Deep Field (Z+)</span>
-         <span className="text-[8px] font-black text-indigo-500/40 uppercase tracking-[0.5em] -rotate-90">Lens Baseline (Z 0)</span>
-      </div>
-
-      <div className="absolute inset-x-0 bottom-0 h-px bg-indigo-500/20"></div>
-
-      {renderSubject('a', subjects.a)}
-      {subjects.activeCount === 2 && renderSubject('b', subjects.b)}
-      {cameras.map((cam, idx) => renderCamera(cam, idx))}
+      <div 
+        className="absolute inset-0 opacity-10 pointer-events-none" 
+        style={{ 
+          backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', 
+          backgroundSize: `${20 * state.plannerZoom}px ${20 * state.plannerZoom}px`, 
+          backgroundPosition: `${(state.plannerOffset.x * 10 * state.plannerZoom) + (containerRef.current?.offsetWidth || 0) / 2}px ${(-state.plannerOffset.z * 10 * state.plannerZoom) + (containerRef.current?.offsetHeight || 0) / 2}px` 
+        }} 
+      />
       
-      <div className="absolute bottom-6 right-8 flex flex-col items-end gap-1 pointer-events-none opacity-40">
-         <span className="text-[8px] font-black text-white uppercase tracking-widest">Physical Stage Planner</span>
-         <span className="text-[7px] font-bold text-white/30 uppercase tracking-[0.2em]">Scale: 1 Unit = 1 FT</span>
-      </div>
+      {state.subjects.map(sub => (
+        <div key={sub.id} style={getPos(sub)} className="absolute -translate-x-1/2 translate-y-1/2 z-20">
+          <div className="relative w-32 h-32 flex items-center justify-center pointer-events-none">
+            
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none" style={{ transform: `rotate(${sub.rotation + 180}deg)` }}>
+              <div 
+                onMouseDown={handleStart('move', 'subject', sub.id)} 
+                onTouchStart={handleStart('move', 'subject', sub.id)}
+                className="relative w-16 h-10 rounded-[50%] border-2 border-indigo-500 bg-indigo-500/20 cursor-move pointer-events-auto shadow-[0_0_15px_rgba(99,102,241,0.2)] flex items-center justify-center"
+              >
+                <div className="w-8 h-8 rounded-full border-2 border-indigo-400 bg-indigo-500/40 shadow-inner" />
+                
+                <div 
+                  onMouseDown={handleStart('rotate-body', 'subject', sub.id)} 
+                  onTouchStart={handleStart('rotate-body', 'subject', sub.id)} 
+                  className="absolute -top-6 left-1/2 -translate-x-1/2 w-8 h-8 flex items-center justify-center cursor-pointer pointer-events-auto group"
+                >
+                  <div className="w-4 h-4 bg-indigo-500 rounded-full border border-white group-hover:scale-125 transition-transform" />
+                </div>
+              </div>
+            </div>
+
+            <div className="absolute inset-0 pointer-events-none" style={{ transform: `rotate(${sub.gaze + 180}deg)` }}>
+               <div 
+                onMouseDown={handleStart('rotate-gaze', 'subject', sub.id)} 
+                onTouchStart={handleStart('rotate-gaze', 'subject', sub.id)} 
+                className="absolute top-2 left-1/2 -translate-x-1/2 w-8 h-8 flex items-center justify-center cursor-pointer pointer-events-auto group"
+               >
+                 <Eye className="w-6 h-6 text-emerald-400 drop-shadow-[0_0_8px_rgba(52,211,153,0.5)] group-hover:scale-125 transition-transform" />
+               </div>
+            </div>
+            
+            <span className="absolute top-[85%] text-[9px] font-black uppercase text-indigo-400 whitespace-nowrap bg-black/80 px-2 py-0.5 rounded border border-white/5 shadow-xl">
+              {sub.label}
+            </span>
+          </div>
+        </div>
+      ))}
+
+      {state.landmarks.map(lm => (
+        <div key={lm.id} style={getPos(lm)} className="absolute -translate-x-1/2 translate-y-1/2 z-10">
+          <div 
+            onMouseDown={handleStart('move', 'landmark', lm.id)} 
+            onTouchStart={handleStart('move', 'landmark', lm.id)} 
+            className="flex flex-col items-center cursor-move p-2"
+          >
+            <MapPin className="w-8 h-8 text-emerald-500/50 drop-shadow-[0_0_8px_rgba(16,185,129,0.3)]" />
+            <span className="text-[7px] font-black uppercase text-emerald-500 whitespace-nowrap bg-black/80 px-1.5 py-0.5 rounded border border-white/5 mt-1">
+              {lm.label}
+            </span>
+          </div>
+        </div>
+      ))}
+
+      {state.cameras.map((cam, idx) => {
+        const fov = getFOV(cam.lens);
+        const isActive = idx === state.activeCameraIndex;
+        const tanHalfFov = Math.tan((fov/2) * Math.PI / 180) * 50;
+        
+        return (
+          <div key={cam.id} style={getPos(cam)} className={`absolute -translate-x-1/2 translate-y-1/2 z-30 transition-all ${isActive ? 'opacity-100 scale-110' : 'opacity-40 scale-100'}`}>
+            <div 
+              onMouseDown={handleStart('move', 'camera', idx)} 
+              onTouchStart={handleStart('move', 'camera', idx)} 
+              className="relative w-24 h-24 flex items-center justify-center cursor-move"
+              style={{ transform: `rotate(${cam.rotation + 180}deg)` }} // Rotate the entire camera assembly together
+            >
+              {/* FOV Cone with Rule of Thirds Grid */}
+              <div 
+                className="absolute w-[300px] h-[300px] pointer-events-none transition-opacity duration-300"
+                style={{ 
+                  opacity: isActive ? 0.3 : 0,
+                  transformOrigin: '50% 50%' 
+                }}
+              >
+                <div 
+                  className="absolute top-1/2 left-1/2 -translate-x-1/2 w-full h-full"
+                  style={{
+                    clipPath: `polygon(50% 50%, ${50 - tanHalfFov}% 0%, ${50 + tanHalfFov}% 0%)`,
+                    background: 'linear-gradient(to top, rgba(99, 102, 241, 0.4), rgba(99, 102, 241, 0.05))'
+                  }}
+                >
+                  <div className="absolute inset-0 w-full h-full">
+                    <div className="absolute top-[16.6%] left-0 w-full h-px bg-white/20" />
+                    <div className="absolute top-[33.3%] left-0 w-full h-px bg-white/20" />
+                    {/* Vertical markers relative to cone width at the top */}
+                    <div className="absolute top-0 left-1/2 -translate-x-[15%] w-px h-full bg-white/20" />
+                    <div className="absolute top-0 left-1/2 translate-x-[15%] w-px h-full bg-white/20" />
+                  </div>
+                </div>
+              </div>
+
+              {/* The camera icon always points towards the cone base now as part of the assembly */}
+              <Camera className="w-10 h-10 text-white drop-shadow-[0_0_15px_rgba(255,255,255,0.4)] z-10" />
+              
+              {/* Rotation Handle - Static relative to assembly, always at the front */}
+              <div className="absolute inset-0 pointer-events-none">
+                <div 
+                  onMouseDown={handleStart('rotate-body', 'camera', idx)} 
+                  onTouchStart={handleStart('rotate-body', 'camera', idx)} 
+                  className="absolute top-0 left-1/2 -translate-x-1/2 w-8 h-8 flex items-center justify-center cursor-pointer pointer-events-auto group"
+                >
+                  <div className="w-3 h-3 bg-white rounded-full border-2 border-indigo-500 group-hover:scale-125 transition-transform" />
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 };

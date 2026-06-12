@@ -1,5 +1,6 @@
 {
   "name": "Cinematic Studio AI",
-  "description": "A high-end professional image generator that uses reference images for background, character, pose, and props, combined with precise lighting and camera controls.",
-  "requestFramePermissions": []
+  "description": "A high-end professional image generator that uses reference images from local upload, Google Photos, or Google Drive, combined with precise lighting and camera controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
 }

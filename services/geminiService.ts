@@ -1,16 +1,9 @@
-import { GoogleGenAI } from "@google/genai";
-import { StudioState, CameraConfig, SubjectConfig } from "../types";
-import { LIGHT_POSITIONS } from "../constants";
 
-/**
- * CINEMATIC PHYSICAL COORDINATE SYSTEM:
- * 1 Unit = 1 Foot (Standard height of human subject: 5.5 - 6.0 units)
- * World X: Stage Left (-) to Stage Right (+)
- * World Z: Distance from Camera Baseline (0) to Infinite Depth (+)
- * Rotation: 0° is North (Toward Deep Stage), 180° is South (Facing Camera)
- */
+import { GoogleGenAI, Type } from "@google/genai";
+import { StudioState, SubjectConfig, Landmark, ReferenceType } from "../types";
+import { LENSES, PRODUCTION_SCALE_CONSTANT, COST_PER_IMAGE, COST_PER_VIDEO, COST_PER_1K_TOKENS } from "../constants";
 
-async function downscaleImage(dataUrl: string, maxWidth = 256, quality = 0.3): Promise<{ data: string; mimeType: string }> {
+async function downscaleImage(dataUrl: string, maxWidth = 512, quality = 0.7): Promise<{ data: string; mimeType: string }> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
@@ -30,145 +23,223 @@ async function downscaleImage(dataUrl: string, maxWidth = 256, quality = 0.3): P
       canvas.width = width;
       canvas.height = height;
       const ctx = canvas.getContext('2d');
-      if (!ctx) return reject(new Error("Canvas context failed"));
+      if (!ctx) return reject(new Error("Canvas context failure"));
       ctx.fillStyle = "white";
       ctx.fillRect(0, 0, width, height);
       ctx.drawImage(img, 0, 0, width, height);
       const scaledDataUrl = canvas.toDataURL('image/jpeg', quality);
       resolve({ data: scaledDataUrl.split(',')[1], mimeType: 'image/jpeg' });
     };
-    img.onerror = () => reject(new Error("Image load failed"));
+    img.onerror = () => reject(new Error("Reference image load failed"));
     img.src = dataUrl;
   });
 }
 
-const getOrientationInstruction = (subj: SubjectConfig, camera: CameraConfig, label: string) => {
-  const subjRot = (subj.rotation + 360) % 360;
-  const camRot = (camera.rotation + 360) % 360;
-  const relAngle = (subjRot - camRot + 360) % 360;
-
-  if (relAngle > 165 && relAngle < 195) return `POSTURE: ${label} is facing DIRECTLY AT the camera lens.`;
-  if (relAngle >= 195 && relAngle < 255) return `POSTURE: ${label} is in a 3/4 view, facing frame LEFT.`;
-  if (relAngle >= 255 && relAngle < 285) return `POSTURE: ${label} is in PURE PROFILE, facing frame LEFT.`;
-  if (relAngle >= 285 && relAngle < 345) return `POSTURE: ${label} is turned away (showing back-left).`;
-  if (relAngle >= 345 || relAngle < 15) return `POSTURE: ${label} is facing COMPLETELY AWAY from camera.`;
-  if (relAngle >= 15 && relAngle < 75) return `POSTURE: ${label} is turned away (showing back-right).`;
-  if (relAngle >= 75 && relAngle < 105) return `POSTURE: ${label} is in PURE PROFILE, facing frame RIGHT.`;
-  return `POSTURE: ${label} is in a 3/4 view, facing frame RIGHT.`;
-};
-
-const getGazeInstruction = (subj: SubjectConfig, other: SubjectConfig | null, camera: CameraConfig, label: string) => {
-  const dx = camera.x - subj.x;
-  const dz = camera.z - subj.z;
-  const angleToCam = (Math.atan2(dx, dz) * 180 / Math.PI + 360) % 360;
-  const camDiff = Math.min(Math.abs(subj.gaze - angleToCam), 360 - Math.abs(subj.gaze - angleToCam));
-  
-  if (camDiff < 15) return `GAZE: ${label} is making direct eye contact with the lens.`;
-  
-  if (other) {
-    const pdx = other.x - subj.x;
-    const pdz = other.z - subj.z;
-    const angleToPartner = (Math.atan2(pdx, pdz) * 180 / Math.PI + 360) % 360;
-    const partnerDiff = Math.min(Math.abs(subj.gaze - angleToPartner), 360 - Math.abs(subj.gaze - angleToPartner));
-    if (partnerDiff < 25) return `GAZE: ${label} is looking at the other subject.`;
-  }
-  return `GAZE: ${label} is looking into the distance, away from camera.`;
-};
-
-export const generateDraftPrompt = async (state: any): Promise<string> => {
+export const analyzeBackground = async (dataUrl: string): Promise<Partial<Landmark>[]> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const parts: any[] = [];
-  const activeCamera = state.cameras[state.activeCameraIndex];
+  const { data, mimeType } = await downscaleImage(dataUrl, 1024, 0.8);
+
+  const response = await ai.models.generateContent({
+    model: 'gemini-3-flash-preview',
+    contents: {
+      parts: [
+        { inlineData: { data, mimeType } },
+        { text: "Identify key background landmarks. Provide labels, descriptions, and relative 3D positions (X: -30 to 30, Z: 20 to 100)." }
+      ]
+    },
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            label: { type: Type.STRING },
+            description: { type: Type.STRING },
+            x: { type: Type.NUMBER },
+            z: { type: Type.NUMBER }
+          },
+          required: ["label", "description", "x", "z"]
+        }
+      }
+    }
+  });
+
+  try {
+    return JSON.parse(response.text || "[]");
+  } catch (e) {
+    return [];
+  }
+};
+
+const getShotScaleLabel = (percentage: number) => {
+  if (percentage > 350) return "Extreme Close Up (ECU)";
+  if (percentage > 160) return "Close Up (CU)";
+  if (percentage > 140) return "Medium Close Up (MCU)";
+  if (percentage > 55) return "Medium Shot (MS)";
+  if (percentage > 30) return "Medium Long Shot (MLS)";
+  if (percentage > 10) return "Long Shot (LS)";
+  return "Wide Shot (WS)";
+};
+
+export const generateDraftPrompt = async (state: StudioState): Promise<{ script: string; cost: number; tokens: number }> => {
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const cam = state.cameras[state.activeCameraIndex];
+  const focalLength = LENSES.find(l => l.label === cam.lens)?.mm || 50;
   
-  const bgRef = state.references['background'];
-  if (bgRef?.dataUrl) {
-    const { data, mimeType } = await downscaleImage(bgRef.dataUrl, 512, 0.4);
-    parts.push({ text: "### STEP 1: GLOBAL WORLD SCALE ANALYSIS ###\nAnalyze this background. Is it a room (10-30ft deep) or a landscape (miles deep)?" });
-    parts.push({ inlineData: { data, mimeType } });
+  const parts: any[] = [];
+  
+  // Attach grounding references
+  for (const key of ['background', 'prop', 'accessories'] as ReferenceType[]) {
+    if (state.references[key]?.dataUrl) {
+      const { data, mimeType } = await downscaleImage(state.references[key].dataUrl!, 256, 0.4);
+      parts.push({ text: `REFERENCE_GLOBAL_${key.toUpperCase()}:` }, { inlineData: { data, mimeType } });
+    }
   }
 
-  const systemInstruction = `You are a Cinematographer and Physical Stage Analyst.
-  
-  BENCHMARK: 1 unit = 1 foot. Standard human height is 5.5 to 6.0 feet.
-  
-  MANDATORY DEPTH RULES:
-  1. ANALYZE THE BACKGROUND: Look for visual cues (trees, horizon, buildings) to set the Z-axis scale.
-  2. NO DEPTH CLIPPING: Subjects can be placed at Z=500 or Z=5000. If Z is high, render them as appropriately small specs in the distance.
-  3. CHARACTER PROPORTION: A character at Z=10 is 6ft tall. At Z=1000, they are tiny.
-  
-  OUTPUT: JSON
-  {
-    "script": "A cinematic script describing the scene, lighting, and EXACT technical placement.",
-    "scale_analysis": "Detailed notes on how the background determines the depth of the characters."
-  }`;
+  const subjectTags = [];
+  for (const sub of state.subjects) {
+    const dx = sub.x - cam.x;
+    const dz = sub.z - cam.z;
+    const dist = Math.sqrt(dx*dx + dz*dz);
+    
+    // Module 2: Scale Controller - Automatic frame height calculation
+    const screenPercentage = (PRODUCTION_SCALE_CONSTANT * focalLength) / Math.max(0.1, dist);
+    const shotLabel = getShotScaleLabel(screenPercentage);
+
+    const angleToSub = (Math.atan2(dx, dz) * 180 / Math.PI + 360) % 360;
+    let relAngle = (angleToSub - cam.rotation + 540) % 360 - 180;
+    const side = relAngle < 0 ? "FRAME_LEFT" : "FRAME_RIGHT";
+
+    // Module 5: Orientation Visibility - Increase gesture if character is small
+    const gestureMultiplier = screenPercentage < 18 ? "EXAGGERATED" : "NATURAL";
+
+    for (const refKey of ['character', 'costume', 'pose'] as ReferenceType[]) {
+      const ref = sub.references[refKey];
+      if (ref?.dataUrl) {
+        const { data, mimeType } = await downscaleImage(ref.dataUrl, 256, 0.4);
+        parts.push({ text: `REFERENCE_SUBJECT_${sub.id.toUpperCase()}_${refKey.toUpperCase()}:` }, { inlineData: { data, mimeType } });
+      }
+    }
+
+    subjectTags.push({
+      id: sub.id,
+      label: sub.label,
+      visual_scale: {
+        frame_height_percentage: `${screenPercentage.toFixed(1)}%`,
+        cinematic_label: shotLabel
+      },
+      spatial_pos: { x: sub.x.toFixed(2), z: sub.z.toFixed(2), distance: `${dist.toFixed(1)}m` },
+      orientation: { 
+        body_yaw: `${sub.rotation.toFixed(0)}deg`, 
+        gaze_yaw: `${sub.gaze.toFixed(0)}deg`,
+        note: "0deg = Facing Camera (South), 180deg = Facing Away (North)"
+      },
+      framing_side: side,
+      gesture_intent: gestureMultiplier
+    });
+  }
+
+  const productionSystemInstruction = `
+You are a VIRTUAL PRODUCTION RENDER ENGINE. Strictly follow this 6-module pipeline.
+
+=== PRODUCTION_PIPELINE_MODULES ===
+1. SCENE ANALYZER: Extract lighting profile (direction, softness, contrast, temperature) and perspective map (horizon_y, fov) from REF_GLOBAL_BACKGROUND.
+2. SCALE CONTROLLER: Strictly set subject height using 'frame_height_percentage'. 
+   - Character height must come from perspective depth, NOT 2D resizing.
+3. LIGHTING ADAPTATION: Match subject lighting to the environment. 
+4. LENS BEHAVIOR MATCHING: Simulate properties of ${focalLength}mm lens. 
+5. ORIENTATION VISIBILITY: Strictly obey body_yaw and gaze_yaw.
+   - ROTATION RULE: 0 degrees is facing DIRECTLY AT THE LENS (South). 180 degrees is facing AWAY FROM LENS (North).
+6. INTEGRATION PASS: Unify subject and background.
+
+=== RENDER_BLUEPRINT ===
+- CAMERA: ${cam.model} | LENS: ${focalLength}mm
+- SUBJECTS: ${JSON.stringify(subjectTags)}
+- LANDMARKS: ${JSON.stringify(state.landmarks.map(lm => ({ label: lm.label, x: lm.x, z: lm.z })))}
+
+Output ONLY a JSON Render Manifest.
+`;
 
   const response = await ai.models.generateContent({
     model: 'gemini-3-flash-preview',
     contents: { 
-      parts: [
-        ...parts, 
-        { text: `STAGE TECHNICAL DATA:
-          Framing: ${state.inferredShotScale}
-          Optics: ${activeCamera.lens}, ${activeCamera.verticalAngle}
-          Camera: X=${activeCamera.x}ft, Z=${activeCamera.z}ft
-          
-          SUBJECT A:
-          - Location: X=${state.subjects.a.x}ft, Z=${state.subjects.a.z}ft
-          - Height Benchmark: 5.8ft
-          - ${getOrientationInstruction(state.subjects.a, activeCamera, "A")}
-          - ${getGazeInstruction(state.subjects.a, state.subjects.activeCount === 2 ? state.subjects.b : null, activeCamera, "A")}
-          
-          SUBJECT B:
-          - Location: ${state.subjects.activeCount === 2 ? `X=${state.subjects.b.x}ft, Z=${state.subjects.b.z}ft` : "N/A"}
-          - Height Benchmark: 5.8ft
-          - ${state.subjects.activeCount === 2 ? getOrientationInstruction(state.subjects.b, activeCamera, "B") : ""}` }
-      ] 
+      parts: [...parts, { text: "Synthesize the Final Render Manifest JSON. Use all production modules. Ensure rotation is calculated such that 0deg faces the lens." }] 
     },
-    config: { systemInstruction, responseMimeType: "application/json" }
+    config: { 
+      systemInstruction: productionSystemInstruction,
+      responseMimeType: "application/json"
+    }
   });
-  return response.text || "";
+
+  const text = response.text || "{}";
+  const tokens = Math.ceil(text.length / 4) + 2000;
+  return { script: text, cost: (tokens / 1000) * COST_PER_1K_TOKENS, tokens };
 };
 
-export const generateStudioImage = async (state: any, draftJson: string): Promise<string> => {
+export const generateStudioImage = async (state: StudioState, draftJson: string): Promise<{ url: string; cost: number }> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const activeCamera = state.cameras[state.activeCameraIndex];
-  let script = "";
-  try { script = JSON.parse(draftJson).script; } catch(e) { script = draftJson; }
-
+  const cam = state.cameras[state.activeCameraIndex];
+  const focalLength = LENSES.find(l => l.label === cam.lens)?.mm || 50;
   const parts: any[] = [];
-  const addRef = async (id: string, role: string) => {
-    const ref = state.references[id];
-    if (ref?.dataUrl) {
-      const { data, mimeType } = await downscaleImage(ref.dataUrl, 1024, 0.5);
-      parts.push({ text: `### [ASSET: ${id.toUpperCase()}] ROLE: ${role} ###` });
-      parts.push({ inlineData: { data, mimeType } });
+  
+  for (const key of ['background', 'prop', 'accessories'] as ReferenceType[]) {
+    if (state.references[key]?.dataUrl) {
+      const { data, mimeType } = await downscaleImage(state.references[key].dataUrl!, 512, 0.6);
+      parts.push({ text: `REF_GLOBAL_${key.toUpperCase()}:` }, { inlineData: { data, mimeType } });
     }
-  };
+  }
 
-  await addRef('background', 'WORLD SCALE AND ENVIRONMENT PLATE.');
-  await addRef('char_a', 'Visual Identity A');
-  await addRef('pose_a', 'Reference Pose');
+  for (const sub of state.subjects) {
+    for (const refKey of ['character', 'costume', 'pose'] as ReferenceType[]) {
+      const ref = sub.references[refKey];
+      if (ref?.dataUrl) {
+        const { data, mimeType } = await downscaleImage(ref.dataUrl, 512, 0.6);
+        parts.push({ text: `REF_SUB_${sub.id.toUpperCase()}_${refKey.toUpperCase()}:` }, { inlineData: { data, mimeType } });
+      }
+    }
+  }
 
-  const directive = `### FINAL PRODUCTION DIRECTIVE - PHYSICAL RENDER ###
-  1. CORE SCRIPT: ${script}
-  2. PHYSICAL DEPTH: Subject A is at Z=${state.subjects.a.z} feet. Benchmark height is 5.8 feet. 
-  3. SCALE MATCH: If Z > 100 in a vast landscape, Subject A must be tiny. If Z < 20, they are close-up.
-  4. PERSPECTIVE: Render from Camera X=${activeCamera.x}ft, Z=${activeCamera.z}ft looking toward ${activeCamera.rotation}°.
-  5. INTEGRATION: Perfect 3D unified lighting and photorealistic integration. 8k resolution.`;
-
-  parts.push({ text: directive });
+  parts.push({ text: `FINAL_RENDER_MANIFEST: ${draftJson}\n\nSTRICT REQUIREMENT: Use the Scene Analyzer and Scale Controller data to render character size perfectly. Apply orientation such that 0deg is facing the lens. Apply 'contact_physics' and 'lens_matching' for ${focalLength}mm.` });
 
   const response = await ai.models.generateContent({
-    model: 'gemini-2.5-flash-image',
+    model: 'gemini-3-pro-image-preview',
     contents: { parts },
     config: { 
-      imageConfig: { 
-        aspectRatio: "16:9"
-      } 
+      imageConfig: { aspectRatio: "16:9", imageSize: "1K" } 
     }
   });
 
   const imgPart = response.candidates?.[0]?.content?.parts.find(p => p.inlineData);
-  if (!imgPart?.inlineData) throw new Error("Renderer Failure.");
-  return `data:image/png;base64,${imgPart.inlineData.data}`;
+  if (!imgPart?.inlineData) throw new Error("Production Render Failed.");
+  return { url: `data:image/png;base64,${imgPart.inlineData.data}`, cost: COST_PER_IMAGE };
+};
+
+export const generateStudioVideo = async (state: StudioState, script: string, baseImage: string, onStatusChange: (s: string) => void): Promise<{ url: string; cost: number }> => {
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const base64Data = baseImage.split(',')[1];
+  
+  let animationPrompt = script;
+  try {
+    const json = JSON.parse(script);
+    animationPrompt = json.cinematic_description || "Animate cinematic motion matching the render manifest.";
+  } catch (e) {}
+
+  let operation = await ai.models.generateVideos({
+    model: 'veo-3.1-fast-generate-preview',
+    prompt: `Motion synthesis based on production physics: ${animationPrompt}`,
+    image: { imageBytes: base64Data, mimeType: 'image/png' },
+    config: { resolution: '720p', aspectRatio: '16:9' }
+  });
+
+  while (!operation.done) {
+    onStatusChange("Synthesizing Motion Physics...");
+    await new Promise(r => setTimeout(r, 10000));
+    operation = await ai.operations.getVideosOperation({ operation });
+  }
+
+  const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
+  const videoResponse = await fetch(`${downloadLink}&key=${process.env.API_KEY}`);
+  const blob = await videoResponse.blob();
+  return { url: URL.createObjectURL(blob), cost: COST_PER_VIDEO };
 };
